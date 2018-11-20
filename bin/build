@@ -1,0 +1,6 @@
+#!/bin/bash
+set -eux -o pipefail
+eval $(minikube docker-env)
+docker build \
+    --tag crossbeam/rustifications:dev \
+    .

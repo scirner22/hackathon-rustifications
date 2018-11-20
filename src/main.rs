@@ -176,10 +176,10 @@ fn main() {
             .resource("/ingest", |r| r.method(http::Method::POST).with_async(ingest))
             .resource("/connect", |r| r.method(http::Method::GET).f(ws_connect))
     })
-    .bind("127.0.0.1:8088")
+    .bind("0.0.0.0:80")
     .unwrap()
     .start();
 
-    println!("Server running at localhost:8088");
+    println!("Server running at 0.0.0.0:80");
     let _ = system.run();
 }

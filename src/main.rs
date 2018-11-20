@@ -20,7 +20,7 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct AppState {
-    accepted_types: Arc<HashSet<String>>,
+    accepted_types: HashSet<String>,
     ws_handles: Arc<Mutex<HashMap<Identifier, Addr<WebSocket>>>>,
 }
 
@@ -119,11 +119,59 @@ impl StreamHandler<ws::Message, ws::ProtocolError> for WebSocket {
     }
 }
 
+#[derive(Message)]
+struct Message(String);
+
+#[derive(Message)]
+struct Connect {
+    addr: Recipient<Message>,
+    id: Identifier,
+}
+
+#[derive(Message)]
+struct Disconnect {
+    id: Identifier,
+}
+
+struct WsArbiter {
+    handles: HashMap<Identifier, Recipient<Message>>,
+}
+
+impl Default for WsArbiter {
+    fn default() -> Self {
+        WsArbiter { handles: HashMap::new() }
+    }
+}
+
+impl Actor for WsArbiter {
+    type Context = Context<Self>;
+}
+
+impl Handler<Connect> for WsArbiter {
+    type Result = ();
+
+    fn handle(&mut self, msg: Connect, _: &mut Context<Self>) -> Self::Result {
+        println!("Adding {:?}", msg.id);
+        self.handles.entry(msg.id.clone()).or_insert(msg.addr);
+        msg.id;
+    }
+}
+
+impl Handler<Disconnect> for WsArbiter {
+    type Result = ();
+
+    fn handle(&mut self, msg: Disconnect, _: &mut Context<Self>) -> Self::Result {
+        println!("Adding {:?}", msg.id);
+        self.handles.remove(&msg.id);
+        msg.id;
+    }
+}
+
 fn ingest(req: HttpRequest<AppState>) -> impl Future<Item=HttpResponse, Error=Error> {
     req.json()
         .from_err()
         .and_then(move |body: Event| {
-            let accepted_types = req.state().accepted_types.clone();
+            let accepted_types = &req.state().accepted_types;
 
             if accepted_types.contains(&body.type_alias) {
                 println!("state accepted types contains what we matching on");
@@ -162,13 +210,13 @@ fn ws_connect(req: &HttpRequest<AppState>) -> Result<HttpResponse, Error> {
 fn main() {
     let system = actix::System::new("hackathon");
 
+    let arbiter = Arbiter::start(|_| WsArbiter::default());
+
     server::new(|| {
         let mut accepted_types = HashSet::new();
-        // TODO add accepted types here!
         accepted_types.insert(String::from("overlap"));
-        let accepted_types = Arc::new(accepted_types);
         let state = AppState {
-            accepted_types: Arc::clone(&accepted_types),
+            accepted_types,
             ws_handles: Arc::new(Mutex::new(HashMap::new()))
         };
 

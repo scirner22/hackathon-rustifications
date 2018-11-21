@@ -1,0 +1,14 @@
+{
+  "type": "overlap",
+  "version": 1,
+  "created_at": "2018-11-20T21:24:54.146748",
+  "created_at_micros": 1542767118,
+  "payload": {
+    "type": "new",
+    "population_id": 1,
+    "partner_population_id": 3,
+    "organization_id": 1,
+    "count": 1,
+    "source_keys": ["f18cca71-3fcb-8ef3-1a23-6187bf0a2389"]
+  }
+}

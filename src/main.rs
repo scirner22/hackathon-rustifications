@@ -7,7 +7,6 @@ extern crate serde_derive;
 extern crate serde_json;
 
 use std::collections::{ HashMap, HashSet };
-use std::sync::{ Arc, Mutex };
 use std::time::{ Duration, Instant };
 
 use actix::prelude::*;
@@ -21,7 +20,7 @@ const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct AppState {
     accepted_types: HashSet<String>,
-    ws_handles: Arc<Mutex<HashMap<Identifier, Addr<WebSocket>>>>,
+    arbiter_addr: Addr<WsArbiter>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -34,7 +33,7 @@ struct Event {
     created_at_micros: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct Identifier {
     organization_id: u32,
     user_id: u32,
@@ -56,10 +55,8 @@ impl WebSocket {
     fn pulse(&self, ctx: &mut <Self as Actor>::Context) {
         ctx.run_interval(HEARTBEAT_INTERVAL, |act, ctx| {
             if Instant::now().duration_since(act.heart_beat) > CLIENT_TIMEOUT {
-                println!("heartbeat failed - disconnecting!");
                 ctx.stop();
             } else {
-                println!("Sending ping!");
                 ctx.ping("");
             }
         });
@@ -70,46 +67,53 @@ impl Actor for WebSocket {
     type Context = ws::WebsocketContext<Self, AppState>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
-        println!("Starting actor!");
         self.pulse(ctx);
 
-        let handles_mutex = ctx.state().ws_handles.clone();
-        let mut handles = handles_mutex.lock().unwrap();
-        handles.entry(self.id.clone()).or_insert(ctx.address());
-        println!("size: {:?}", handles.len());
+        let addr = ctx.address();
+        ctx.state()
+            .arbiter_addr
+            .send(Connect {
+                addr: addr.recipient(),
+                id: self.id.clone(),
+            })
+            .into_actor(self)
+            .then(move |res, _act, ctx| {
+                match res {
+                    Ok(_) => (),
+                    _ => ctx.stop(),
+                }
+                actix::fut::ok(())
+            })
+            .wait(ctx);
     }
 
-    fn stopped(&mut self, ctx: &mut Self::Context) {
-        println!("Stopped actor!");
+    fn stopping(&mut self, ctx: &mut Self::Context) -> Running {
+        let id = self.id.clone();
+        ctx.state().arbiter_addr.do_send(Disconnect { id });
+        Running::Stop
 
-        let handles_mutex = ctx.state().ws_handles.clone();
-        let mut handles = handles_mutex.lock().unwrap();
-        handles.remove(&self.id);
-        println!("size: {:?}", handles.len());
+    }
+}
+
+impl Handler<Message> for WebSocket {
+    type Result = ();
+
+    fn handle(&mut self, msg: Message, ctx: &mut Self::Context) {
+        ctx.text(msg.0);
     }
 }
 
 impl StreamHandler<ws::Message, ws::ProtocolError> for WebSocket {
     fn handle(&mut self, msg: ws::Message, ctx: &mut Self::Context) {
-        println!("WS: {:?}", msg);
-        {
-            let handles_mutex = ctx.state().ws_handles.clone();
-            let handles = handles_mutex.lock().unwrap();
-            println!("size: {:?}", handles.len());
-            println!("handles: {:?}", handles.keys().collect::<Vec<_>>());
-        }
         match msg {
             ws::Message::Ping(msg) => {
-                println!("Got ping!");
                 self.heart_beat = Instant::now();
                 ctx.pong(&msg);
             }
             ws::Message::Pong(_) => {
-                println!("Got pong!");
                 self.heart_beat = Instant::now();
             }
             ws::Message::Close(_) => {
-                println!("In close!");
                 ctx.stop();
             }
             _ => {
@@ -133,6 +137,12 @@ struct Disconnect {
     id: Identifier,
 }
 
+#[derive(Message)]
+struct FwdMessage {
+    id: Identifier,
+    event: Event,
+}
+
 struct WsArbiter {
     handles: HashMap<Identifier, Recipient<Message>>,
 }
@@ -153,7 +163,6 @@ impl Handler<Connect> for WsArbiter {
     fn handle(&mut self, msg: Connect, _: &mut Context<Self>) -> Self::Result {
         println!("Adding {:?}", msg.id);
         self.handles.entry(msg.id.clone()).or_insert(msg.addr);
-        msg.id;
     }
 }
 
@@ -161,9 +170,23 @@ impl Handler<Disconnect> for WsArbiter {
     type Result = ();
 
     fn handle(&mut self, msg: Disconnect, _: &mut Context<Self>) -> Self::Result {
-        println!("Adding {:?}", msg.id);
+        println!("Removing {:?}", msg.id);
         self.handles.remove(&msg.id);
-        msg.id;
+    }
+}
+
+impl Handler<FwdMessage> for WsArbiter {
+    type Result = ();
+
+    fn handle(&mut self, msg: FwdMessage, _: &mut Context<Self>) -> Self::Result {
+        println!("Fwding {:?}", msg.id);
+        if let Some(addr) = self.handles.get(&msg.id) {
+            println!("user logged in!");
+            let msg_string = serde_json::to_string(&msg.event).unwrap();
+            addr.do_send(Message(msg_string)).unwrap();
+        } else {
+            println!("user not logged in!");
+        }
     }
 }
 
@@ -174,13 +197,13 @@ fn ingest(req: HttpRequest<AppState>) -> impl Future<Item=HttpResponse, Error=Er
             let accepted_types = &req.state().accepted_types;
 
             if accepted_types.contains(&body.type_alias) {
-                println!("state accepted types contains what we matching on");
-                {
-                    let handles_mutex = req.state().ws_handles.clone();
-                    let handles = handles_mutex.lock().unwrap();
-                    println!("size: {:?}", handles.len());
-                    println!("handles: {:?}", handles.keys().collect::<Vec<_>>());
-                }
+                println!("accepted type");
+                req.state()
+                    .arbiter_addr
+                    .do_send(FwdMessage {
+                        id: Identifier { organization_id: 1, user_id: 1},
+                        event: body,
+                    })
             }
 
             Ok(HttpResponse::Created().body(""))
@@ -193,18 +216,8 @@ fn ws_connect(req: &HttpRequest<AppState>) -> Result<HttpResponse, Error> {
     let organization_id = 1;
     let user_id = 1;
     let id = Identifier { organization_id, user_id };
-    {
-        let handles_mutex = req.state().ws_handles.clone();
-        let handles = handles_mutex.lock().unwrap();
-        println!("size: {:?}", handles.len());
-        println!("handles: {:?}", handles.keys().collect::<Vec<_>>());
-    }
 
-    let actor = WebSocket::new(id);
-    // let addr = WebSocket::create(|ctx| {
-    //     WebSocket::new(id)
-    // });
-    ws::start(req, actor)
+    ws::start(req, WebSocket::new(id))
 }
 
 fn main() {
@@ -212,12 +225,12 @@ fn main() {
 
     let arbiter = Arbiter::start(|_| WsArbiter::default());
 
-    server::new(|| {
+    server::new(move || {
         let mut accepted_types = HashSet::new();
         accepted_types.insert(String::from("overlap"));
         let state = AppState {
             accepted_types,
-            ws_handles: Arc::new(Mutex::new(HashMap::new()))
+            arbiter_addr: arbiter.clone(),
         };
 
         App::with_state(state)

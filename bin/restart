@@ -1,0 +1,5 @@
+#!/bin/bash
+set -eux -o pipefail
+# below from https://github.com/kubernetes/kubernetes/issues/27081
+kubectl patch deployment rustifications -p \
+  "{\"spec\":{\"template\":{\"metadata\":{\"labels\":{\"date\":\"`date +'%s'`\"}}}}}"
